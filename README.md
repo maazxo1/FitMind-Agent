@@ -1,6 +1,6 @@
 <div align="center">
 
-# FitMind — AI Fitness Coach
+# FitMind AI Fitness Coach
 
 **A production-grade, multi-agent AI fitness coach built entirely on Cloudflare's edge platform.**
 
