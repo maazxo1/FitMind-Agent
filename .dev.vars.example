@@ -1,0 +1,14 @@
+# Copy this file to .dev.vars and fill in your values.
+# .dev.vars is gitignored — never commit real secrets.
+
+# Required
+GEMINI_API_KEY=
+ADMIN_SECRET=
+
+# Recommended (features degrade gracefully without these)
+OPENWEATHER_API_KEY=
+RAPIDAPI_KEY=
+
+# Optional — routes Gemini calls through Cloudflare AI Gateway
+CF_ACCOUNT_ID=
+AI_GATEWAY_NAME=

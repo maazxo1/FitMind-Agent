@@ -3,9 +3,11 @@
   "version": "0.0.0",
   "private": true,
   "scripts": {
-    "deploy": "wrangler deploy",
+    "deploy": "npm run build:client && wrangler deploy",
     "dev": "wrangler dev",
+    "dev:client": "cd client && npm run dev",
     "start": "wrangler dev",
+    "build:client": "cd client && npm run build",
     "test": "vitest",
     "cf-typegen": "wrangler types"
   },
@@ -15,5 +17,11 @@
     "typescript": "^5.5.2",
     "vitest": "~3.2.0",
     "wrangler": "^4.103.0"
+  },
+  "dependencies": {
+    "@ai-sdk/google": "^3.0.83",
+    "agents": "^0.16.2",
+    "ai": "^6.0.208",
+    "zod": "^4.4.3"
   }
 }
