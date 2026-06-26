@@ -1,7 +1,7 @@
 import { Agent } from 'agents';
 import type { Connection, WSMessage } from 'agents';
 import { retrieveContext } from '../lib/rag';
-import { createHumanReview, saveMessage, getRecentHistory, clearConversationHistory } from '../lib/db';
+import { createHumanReview, saveMessage, getRecentHistory, clearConversationHistory, logActivity } from '../lib/db';
 
 export interface FitnessCoachState {
 	userId: string;
@@ -14,7 +14,11 @@ export interface FitnessCoachState {
 	activityLevel: string;
 	medicalNotes: string;
 	conversationHistory: GeminiMessage[];
-	agentNotes: string[]; // long-term facts the agent learns about the user
+	agentNotes: string[];
+	geminiFailures: number;      // circuit breaker: consecutive Gemini error count
+	geminiBackoffUntil: number;  // circuit breaker: epoch ms, 0 = no backoff active
+	msgCount: number;            // rate limiter: messages sent in current window
+	msgWindowStart: number;      // rate limiter: epoch ms when current window started
 }
 
 interface GeminiMessage {
@@ -55,14 +59,7 @@ RULES:
 - Adapt all advice to the user's medical notes and remembered facts.
 - For nutrition: give exact calories, protein targets, meal ideas.
 - For recovery/sleep: give actionable, science-backed advice.
-- Call save_user_note PROACTIVELY — after EVERY conversation turn, ask yourself: "Did I learn anything worth remembering?" Save notes for:
-  • Anything the user mentions about their body, pain, or limitations (e.g. "bad left knee", "lower back pain")
-  • Dietary preferences or restrictions (e.g. "vegetarian", "lactose intolerant", "intermittent fasting")
-  • Training preferences (e.g. "prefers morning workouts", "trains at home", "no equipment")
-  • Progress they share (e.g. "can now run 5km", "bench pressed 80kg")
-  • Specific goals beyond their profile (e.g. "wants to run a marathon in April")
-  • Questions they keep asking (e.g. "asks about sleep a lot — prioritise recovery advice")
-  • Also save a note on the FIRST message summarising what you know from their profile (e.g. "User goal: weight loss | 25yo | 80kg | moderate activity")
+- Call save_user_note ONLY when you learn something genuinely new and important that is NOT already in your notes above: a new injury or physical limitation, a dietary restriction, a significant goal change, a major milestone achieved, or a strong training preference. Do NOT save generic observations, do NOT save on every turn, do NOT duplicate existing notes. Maximum 1 save per conversation turn. Good examples: "User has a bad left knee — avoid impact", "User is vegetarian", "User can now bench 100kg". Bad examples: "User asked about calories", "User wants to gain muscle" (already in profile).
 - Call flag_for_human_review ONLY for ACUTE safety risks. After flagging, still provide modified advice.
 
 FORMAT YOUR RESPONSE AS PROFESSIONAL MARKDOWN:
@@ -133,6 +130,8 @@ export class FitnessCoachAgent extends Agent<Env, FitnessCoachState> {
 		userId: '', sessionId: '', userName: 'User', age: 0,
 		weight_kg: 0, height_cm: 0, fitnessGoal: 'general fitness',
 		activityLevel: 'moderate', medicalNotes: '', conversationHistory: [], agentNotes: [],
+		geminiFailures: 0, geminiBackoffUntil: 0,
+		msgCount: 0, msgWindowStart: 0,
 	};
 
 	// Serialize concurrent chat messages so setState calls never race
@@ -177,11 +176,23 @@ export class FitnessCoachAgent extends Agent<Env, FitnessCoachState> {
 				if (p.age !== undefined && (typeof p.age !== 'number' || p.age < 5 || p.age > 150)) return;
 				if (p.weight_kg !== undefined && (typeof p.weight_kg !== 'number' || p.weight_kg <= 0 || p.weight_kg > 700)) return;
 				if (p.height_cm !== undefined && (typeof p.height_cm !== 'number' || p.height_cm <= 0 || p.height_cm > 300)) return;
-				this.setState({ ...this.state, ...p });
+				// Whitelist allowed fields — never let the client overwrite internal state
+				this.setState({
+					...this.state,
+					userId: p.userId,
+					sessionId: typeof p.sessionId === 'string' ? p.sessionId : this.state.sessionId,
+					userName: typeof p.userName === 'string' ? p.userName : this.state.userName,
+					age: typeof p.age === 'number' ? p.age : this.state.age,
+					weight_kg: typeof p.weight_kg === 'number' ? p.weight_kg : this.state.weight_kg,
+					height_cm: typeof p.height_cm === 'number' ? p.height_cm : this.state.height_cm,
+					fitnessGoal: typeof p.fitnessGoal === 'string' ? p.fitnessGoal : this.state.fitnessGoal,
+					activityLevel: typeof p.activityLevel === 'string' ? p.activityLevel : this.state.activityLevel,
+					medicalNotes: typeof p.medicalNotes === 'string' ? p.medicalNotes : this.state.medicalNotes,
+				});
 				let history: Array<{ role: string; content: string; created_at: string }> = [];
 				try {
-					if (data.profile.userId) {
-						history = await getRecentHistory(this.env.fitness_coach_db, data.profile.userId, 30);
+					if (p.userId) {
+						history = await getRecentHistory(this.env.fitness_coach_db, p.userId, 30);
 					}
 				} catch { /* non-fatal — proceed without history */ }
 				connection.send(JSON.stringify({
@@ -199,6 +210,19 @@ export class FitnessCoachAgent extends Agent<Env, FitnessCoachState> {
 					connection.send(JSON.stringify({ type: 'message', role: 'assistant', content: 'Your message is too long. Please keep it under 10,000 characters.' }));
 					return;
 				}
+
+				// Rate limiting: max 20 messages per 60s window per user
+				const now = Date.now();
+				const windowMs = 60_000;
+				const maxMsgs = 20;
+				const inWindow = (now - (this.state.msgWindowStart ?? 0)) < windowMs;
+				const count = inWindow ? (this.state.msgCount ?? 0) : 0;
+				if (count >= maxMsgs) {
+					connection.send(JSON.stringify({ type: 'message', role: 'assistant', content: 'You are sending messages too quickly. Please wait a moment before continuing.' }));
+					return;
+				}
+				this.setState({ ...this.state, msgCount: count + 1, msgWindowStart: inWindow ? (this.state.msgWindowStart ?? now) : now });
+
 				this.chatQueue = this.chatQueue
 					.then(() => this.handleChat(connection, userMessage))
 					.catch(() => {});
@@ -229,9 +253,10 @@ export class FitnessCoachAgent extends Agent<Env, FitnessCoachState> {
 
 			if (data.type === 'clear_chat') {
 				this.setState({ ...this.state, conversationHistory: [] });
-				if (this.state.userId) {
+				// Scoped to current session only — does not wipe history from other sessions
+				if (this.state.sessionId) {
 					try {
-						await clearConversationHistory(this.env.fitness_coach_db, this.state.userId);
+						await clearConversationHistory(this.env.fitness_coach_db, this.state.sessionId);
 					} catch (err) {
 						console.warn('[FitMind] Failed to clear D1 conversation history:', err);
 					}
@@ -243,7 +268,7 @@ export class FitnessCoachAgent extends Agent<Env, FitnessCoachState> {
 			console.error('Agent error:', err);
 			connection.send(JSON.stringify({
 				type: 'message', role: 'assistant',
-				content: `Sorry, I ran into an error: ${err?.message ?? 'Unknown error'}. Please try again.`,
+				content: 'Sorry, something went wrong on my end. Please try again.',
 			}));
 		}
 	}
@@ -289,10 +314,12 @@ export class FitnessCoachAgent extends Agent<Env, FitnessCoachState> {
 
 			// Persist to D1 before updating DO state so both sources stay in sync
 			if (this.state.sessionId) {
-				await Promise.allSettled([
+				const [r1, r2] = await Promise.allSettled([
 					saveMessage(this.env.fitness_coach_db, { session_id: this.state.sessionId, role: 'user', content: userMessage }),
 					saveMessage(this.env.fitness_coach_db, { session_id: this.state.sessionId, role: 'assistant', content: finalText }),
 				]);
+				if (r1.status === 'rejected') console.error('[FitMind] D1 user message save failed:', r1.reason);
+				if (r2.status === 'rejected') console.error('[FitMind] D1 assistant message save failed:', r2.reason);
 			}
 			this.setState({ ...this.state, conversationHistory: history.slice(-20) });
 		} catch (err: any) {
@@ -305,31 +332,51 @@ export class FitnessCoachAgent extends Agent<Env, FitnessCoachState> {
 		}
 	}
 
-	// Call WorkoutPlannerAgent DO via HTTP
+	// Call WorkoutPlannerAgent DO via HTTP with a 25s timeout to prevent chat queue starvation
 	private async callWorkoutAgent(query: string, ragContext: string): Promise<string> {
+		const internalKey = this.env.INTERNAL_KEY || this.env.ADMIN_SECRET;
+		if (!this.env.INTERNAL_KEY) console.warn('[FitMind] INTERNAL_KEY not set — falling back to ADMIN_SECRET for inter-agent auth');
 		const id = this.env.WorkoutPlannerAgent.idFromName(this.state.userId);
 		const stub = this.env.WorkoutPlannerAgent.get(id);
-		const res = await stub.fetch('http://internal/plan', {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json', 'X-Internal-Key': this.env.ADMIN_SECRET },
-			body: JSON.stringify({
-				profile: this.state,
-				query,
-				ragContext,
-				conversationHistory: (this.state.conversationHistory ?? []).slice(-6),
-				agentNotes: this.state.agentNotes,
-			}),
-		});
-		const data = await res.json<any>();
-		if (!res.ok || data.error) {
-			const msg: string = data.error ?? 'Workout agent failed';
-			throw new Error(
-				msg.includes('429')
-					? 'The AI is temporarily rate-limited. Please wait 30 seconds and try again.'
-					: msg
-			);
+		const ctrl = new AbortController();
+		const timer = setTimeout(() => ctrl.abort(), 25000);
+		try {
+			const res = await stub.fetch('http://internal/plan', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json', 'X-Internal-Key': internalKey },
+				body: JSON.stringify({
+					profile: {
+						userName: this.state.userName,
+						age: this.state.age,
+						weight_kg: this.state.weight_kg,
+						height_cm: this.state.height_cm,
+						fitnessGoal: this.state.fitnessGoal,
+						activityLevel: this.state.activityLevel,
+						medicalNotes: this.state.medicalNotes,
+					},
+					query,
+					ragContext,
+					conversationHistory: (this.state.conversationHistory ?? []).slice(-6),
+					agentNotes: this.state.agentNotes,
+				}),
+				signal: ctrl.signal,
+			});
+			const data = await res.json<any>();
+			if (!res.ok || data.error) {
+				const msg: string = data.error ?? 'Workout agent failed';
+				throw new Error(
+					msg.includes('429')
+						? 'The AI is temporarily rate-limited. Please wait 30 seconds and try again.'
+						: msg
+				);
+			}
+			return data.plan;
+		} catch (err: any) {
+			if (err.name === 'AbortError') throw new Error('Workout plan generation timed out. Please try again.');
+			throw err;
+		} finally {
+			clearTimeout(timer);
 		}
-		return data.plan;
 	}
 
 	// Stream Gemini SSE response — sends chunks to connection, returns full text + any tool calls
@@ -346,7 +393,8 @@ export class FitnessCoachAgent extends Agent<Env, FitnessCoachState> {
 			body: JSON.stringify(body),
 		};
 
-		const RETRYABLE = new Set([429, 500, 503]);
+		// 429 is NOT retried — retrying a rate-limited endpoint wastes quota and delays fallback
+		const RETRYABLE = new Set([500, 503]);
 		let res: Response = await fetch(url, opts);
 		for (let attempt = 0; RETRYABLE.has(res.status) && attempt < 2; attempt++) {
 			await new Promise(r => setTimeout(r, Math.min(1000 * Math.pow(2, attempt), 3000) + Math.random() * 500));
@@ -354,10 +402,14 @@ export class FitnessCoachAgent extends Agent<Env, FitnessCoachState> {
 		}
 
 		if (!res.ok) {
-			const body = await res.text().catch(() => '');
-			console.error(`Gemini streamGenerateContent error ${res.status}:`, body);
-			const err: any = JSON.parse(body || '{}');
-			const msg = err?.error?.message ?? `LLM failed: ${res.status}`;
+			const errBody = await res.text().catch(() => '');
+			console.error(`Gemini streamGenerateContent error ${res.status}:`, errBody);
+			let msg: string;
+			try {
+				msg = (JSON.parse(errBody || '{}'))?.error?.message ?? `LLM failed: ${res.status}`;
+			} catch {
+				msg = `LLM failed: ${res.status}`;
+			}
 			throw new Error(
 				res.status === 429
 					? 'The AI is temporarily rate-limited. Please wait 30 seconds and try again.'
@@ -375,36 +427,40 @@ export class FitnessCoachAgent extends Agent<Env, FitnessCoachState> {
 		const calls: Array<{ name: string; args: any }> = [];
 		const rawParts: any[] = [];
 
-		while (true) {
-			const { done, value } = await reader.read();
-			if (done) break;
+		try {
+			while (true) {
+				const { done, value } = await reader.read();
+				if (done) break;
 
-			sseBuffer += decoder.decode(value, { stream: true });
-			const lines = sseBuffer.split('\n');
-			sseBuffer = lines.pop() ?? '';
+				sseBuffer += decoder.decode(value, { stream: true });
+				const lines = sseBuffer.split('\n');
+				sseBuffer = lines.pop() ?? '';
 
-			for (const line of lines) {
-				if (!line.startsWith('data: ')) continue;
-				const json = line.slice(6).trim();
-				if (!json || json === '[DONE]') continue;
-				try {
-					const chunk = JSON.parse(json);
-					const parts: any[] = chunk.candidates?.[0]?.content?.parts ?? [];
-					for (const part of parts) {
-						rawParts.push(part);
-						if (part.text && !part.thought) {
-							fullText += part.text;
-							// Only stream text to client if no tool calls in this turn yet
-							if (calls.length === 0) {
-								connection.send(JSON.stringify({ type: 'chunk', content: part.text }));
+				for (const line of lines) {
+					if (!line.startsWith('data: ')) continue;
+					const json = line.slice(6).trim();
+					if (!json || json === '[DONE]') continue;
+					try {
+						const chunk = JSON.parse(json);
+						const parts: any[] = chunk.candidates?.[0]?.content?.parts ?? [];
+						for (const part of parts) {
+							rawParts.push(part);
+							if (part.text && !part.thought) {
+								fullText += part.text;
+								// Only stream text to client if no tool calls in this turn yet
+								if (calls.length === 0) {
+									connection.send(JSON.stringify({ type: 'chunk', content: part.text }));
+								}
+							}
+							if (part.functionCall) {
+								calls.push({ name: part.functionCall.name, args: part.functionCall.args });
 							}
 						}
-						if (part.functionCall) {
-							calls.push({ name: part.functionCall.name, args: part.functionCall.args });
-						}
-					}
-				} catch { /* ignore malformed SSE chunks */ }
+					} catch (e) { console.warn('[FitMind] Malformed SSE chunk skipped:', e); }
+				}
 			}
+		} finally {
+			reader.cancel().catch(() => {});
 		}
 
 		return { text: fullText, calls, rawParts };
@@ -423,24 +479,33 @@ export class FitnessCoachAgent extends Agent<Env, FitnessCoachState> {
 				content: m.parts.map((p: any) => p.text ?? '').join(''),
 			})),
 		];
-		const stream = await (this.env.AI.run('@cf/meta/llama-3.3-70b-instruct-fp8-fast', {
-			messages, stream: true,
-		}) as Promise<ReadableStream>);
+		let stream: ReadableStream;
+		try {
+			stream = await (this.env.AI.run('@cf/meta/llama-3.3-70b-instruct-fp8-fast', {
+				messages, stream: true,
+			}) as Promise<ReadableStream>);
+		} catch {
+			throw new Error('Both AI models are temporarily unavailable. Please try again in a moment.');
+		}
 		const reader = stream.getReader();
 		const decoder = new TextDecoder();
 		let fullText = '';
-		while (true) {
-			const { done, value } = await reader.read();
-			if (done) break;
-			for (const line of decoder.decode(value, { stream: true }).split('\n')) {
-				if (!line.startsWith('data: ')) continue;
-				const json = line.slice(6).trim();
-				if (!json || json === '[DONE]') continue;
-				try {
-					const text = JSON.parse(json).response ?? '';
-					if (text) { fullText += text; connection.send(JSON.stringify({ type: 'chunk', content: text })); }
-				} catch { /* ignore malformed */ }
+		try {
+			while (true) {
+				const { done, value } = await reader.read();
+				if (done) break;
+				for (const line of decoder.decode(value, { stream: true }).split('\n')) {
+					if (!line.startsWith('data: ')) continue;
+					const json = line.slice(6).trim();
+					if (!json || json === '[DONE]') continue;
+					try {
+						const text = JSON.parse(json).response ?? '';
+						if (text) { fullText += text; connection.send(JSON.stringify({ type: 'chunk', content: text })); }
+					} catch { /* ignore malformed */ }
+				}
 			}
+		} finally {
+			reader.cancel().catch(() => {});
 		}
 		connection.send(JSON.stringify({ type: 'message_done' }));
 		return fullText;
@@ -452,20 +517,32 @@ export class FitnessCoachAgent extends Agent<Env, FitnessCoachState> {
 			...(this.state.conversationHistory ?? [] as GeminiMessage[]),
 			{ role: 'user', parts: [{ text: userMessage }] },
 		];
+
+		// Circuit breaker: if Gemini has failed 3+ times recently, skip it entirely
+		if ((this.state.geminiBackoffUntil ?? 0) > Date.now()) {
+			connection.send(JSON.stringify({ type: 'status', status: 'thinking', agent: 'backup' }));
+			return await this.streamWorkersAI(GENERAL_PROMPT(this.state, ragContext), contents, connection);
+		}
+
 		const sysBody = {
 			system_instruction: { parts: [{ text: GENERAL_PROMPT(this.state, ragContext) }] },
 			tools: [{ functionDeclarations: [SAVE_NOTE_DECLARATION, FLAG_DECLARATION, CALORIE_DECLARATION, BMI_DECLARATION] }],
 			generationConfig: { maxOutputTokens: 8192, thinkingConfig: { thinkingBudget: 0 } },
 		};
 
+		const llmStart = Date.now();
 		for (let i = 0; i < 5; i++) {
 			let result: { text: string; calls: Array<{ name: string; args: any }>; rawParts: any[] };
 			try {
 				result = await this.streamGemini({ ...sysBody, contents }, connection);
 			} catch (err: any) {
-				if (i === 0 && (err.message?.includes('rate-limited') || err.message?.includes('high demand'))) {
-					// No chunks sent yet — transparently fall back to Workers AI
-					connection.send(JSON.stringify({ type: 'status', status: 'thinking', agent: 'backup' }));
+				if (err.message?.includes('rate-limited') || err.message?.includes('high demand')) {
+					if (i === 0) connection.send(JSON.stringify({ type: 'status', status: 'thinking', agent: 'backup' }));
+					const is429 = err.message.includes('rate-limited');
+					const failures = (this.state.geminiFailures ?? 0) + 1;
+					// 429 trips immediately; other transient errors trip after 3 consecutive failures
+					const backoffUntil = (is429 || failures >= 3) ? Date.now() + 90_000 : (this.state.geminiBackoffUntil ?? 0);
+					this.setState({ ...this.state, geminiFailures: failures, geminiBackoffUntil: backoffUntil });
 					return await this.streamWorkersAI(GENERAL_PROMPT(this.state, ragContext), contents, connection);
 				}
 				throw err;
@@ -475,6 +552,21 @@ export class FitnessCoachAgent extends Agent<Env, FitnessCoachState> {
 			if (calls.length === 0) {
 				// Final text turn — already streamed to client, signal completion
 				connection.send(JSON.stringify({ type: 'message_done' }));
+				// Reset circuit breaker on successful Gemini response
+				if ((this.state.geminiFailures ?? 0) > 0) {
+					this.setState({ ...this.state, geminiFailures: 0, geminiBackoffUntil: 0 });
+				}
+				// Log LLM call (non-blocking)
+				if (this.state.sessionId) {
+					logActivity(this.env.fitness_coach_db, {
+						session_id: this.state.sessionId,
+						action: 'llm_call',
+						tool_name: 'gemini-2.5-flash',
+						input_summary: userMessage.slice(0, 200),
+						output_summary: text.slice(0, 200),
+						latency_ms: Date.now() - llmStart,
+					}).catch(e => console.warn('[FitMind] logActivity failed:', e));
+				}
 				return text;
 			}
 
@@ -498,39 +590,42 @@ export class FitnessCoachAgent extends Agent<Env, FitnessCoachState> {
 
 	private async executeTool(name: string, args: any): Promise<string> {
 		const { state, env } = this;
+		const toolStart = Date.now();
+
+		let result: string;
 
 		if (name === 'save_user_note') {
 			const note = String(args.note ?? '').trim();
-			if (!note) return 'Note was empty, nothing saved.';
-			const notes = [...(state.agentNotes ?? [])];
-			if (!notes.includes(note)) {
-				notes.push(note);
-				const updated = notes.slice(-30); // keep up to 30 facts
-				this.setState({ ...state, agentNotes: updated });
-				try { this.broadcast(JSON.stringify({ type: 'memory', notes: updated })); } catch { /* clients disconnected */ }
+			if (!note) {
+				result = 'Note was empty, nothing saved.';
+			} else {
+				const notes = [...(state.agentNotes ?? [])];
+				if (!notes.includes(note)) {
+					notes.push(note);
+					const updated = notes.slice(-30); // keep up to 30 facts
+					this.setState({ ...state, agentNotes: updated });
+					try { this.broadcast(JSON.stringify({ type: 'memory', notes: updated })); } catch { /* clients disconnected */ }
+				}
+				result = `Remembered: "${note}"`;
 			}
-			return `Remembered: "${note}"`;
-		}
-
-		if (name === 'calculate_bmi') {
+		} else if (name === 'calculate_bmi') {
 			const bmi = args.weight_kg / Math.pow(args.height_cm / 100, 2);
 			const cat = bmi < 18.5 ? 'Underweight' : bmi < 25 ? 'Normal weight' : bmi < 30 ? 'Overweight' : 'Obese';
-			return `BMI: ${bmi.toFixed(1)} (${cat}).`;
-		}
-
-		if (name === 'calculate_calories') {
+			result = `BMI: ${bmi.toFixed(1)} (${cat}).`;
+		} else if (name === 'calculate_calories') {
 			const { weight_kg, height_cm, age, activityLevel } = state;
-			if (!weight_kg || !height_cm || !age) return 'User profile incomplete.';
-			const bmr = args.gender === 'male'
-				? 10 * weight_kg + 6.25 * height_cm - 5 * age + 5
-				: 10 * weight_kg + 6.25 * height_cm - 5 * age - 161;
-			const mult: Record<string, number> = { sedentary: 1.2, light: 1.375, moderate: 1.55, very_active: 1.725 };
-			const tdee = Math.round(bmr * (mult[activityLevel] ?? 1.55));
-			const targets: Record<string, number> = { weight_loss: tdee - 400, maintenance: tdee, muscle_gain: tdee + 250 };
-			return `BMR: ${Math.round(bmr)} kcal | TDEE: ${tdee} kcal | Target (${args.goal}): ${targets[args.goal]} kcal/day | Protein: ${Math.round(weight_kg * 1.8)}g/day`;
-		}
-
-		if (name === 'flag_for_human_review') {
+			if (!weight_kg || !height_cm || !age) {
+				result = 'User profile incomplete.';
+			} else {
+				const bmr = args.gender === 'male'
+					? 10 * weight_kg + 6.25 * height_cm - 5 * age + 5
+					: 10 * weight_kg + 6.25 * height_cm - 5 * age - 161;
+				const mult: Record<string, number> = { sedentary: 1.2, light: 1.375, moderate: 1.55, very_active: 1.725 };
+				const tdee = Math.round(bmr * (mult[activityLevel] ?? 1.55));
+				const targets: Record<string, number> = { weight_loss: tdee - 400, maintenance: tdee, muscle_gain: tdee + 250 };
+				result = `BMR: ${Math.round(bmr)} kcal | TDEE: ${tdee} kcal | Target (${args.goal}): ${targets[args.goal]} kcal/day | Protein: ${Math.round(weight_kg * 1.8)}g/day`;
+			}
+		} else if (name === 'flag_for_human_review') {
 			if (state.sessionId && state.userId) {
 				try {
 					await createHumanReview(env.fitness_coach_db, {
@@ -543,9 +638,23 @@ export class FitnessCoachAgent extends Agent<Env, FitnessCoachState> {
 					console.error('Failed to persist human review:', err);
 				}
 			}
-			return `Flagged for human trainer review. Reason: ${args.reason}`;
+			result = `Flagged for human trainer review. Reason: ${args.reason}`;
+		} else {
+			result = `Unknown tool: ${name}`;
 		}
 
-		return `Unknown tool: ${name}`;
+		// Log tool execution (non-blocking)
+		if (state.sessionId) {
+			logActivity(env.fitness_coach_db, {
+				session_id: state.sessionId,
+				action: 'tool_call',
+				tool_name: name,
+				input_summary: JSON.stringify(args).slice(0, 200),
+				output_summary: result.slice(0, 200),
+				latency_ms: Date.now() - toolStart,
+			}).catch(e => console.warn('[FitMind] logActivity failed:', e));
+		}
+
+		return result;
 	}
 }

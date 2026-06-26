@@ -71,6 +71,12 @@ export async function getUserSessions(db: D1Database, userId: string): Promise<S
 	return result.results;
 }
 
+export async function getActiveSession(db: D1Database, userId: string): Promise<Session | null> {
+	return db.prepare(
+		`SELECT * FROM sessions WHERE user_id = ? AND status = 'active' ORDER BY created_at DESC LIMIT 1`
+	).bind(userId).first<Session>();
+}
+
 // Conversations
 export async function saveMessage(db: D1Database, data: Omit<Conversation, 'id'>): Promise<void> {
 	const id = randomUUID();
@@ -100,11 +106,8 @@ export async function getRecentHistory(db: D1Database, userId: string, limit = 2
 	return result.results.reverse(); // oldest first
 }
 
-export async function clearConversationHistory(db: D1Database, userId: string): Promise<void> {
-	await db.prepare(
-		`DELETE FROM conversations
-		 WHERE session_id IN (SELECT id FROM sessions WHERE user_id = ?)`
-	).bind(userId).run();
+export async function clearConversationHistory(db: D1Database, sessionId: string): Promise<void> {
+	await db.prepare(`DELETE FROM conversations WHERE session_id = ?`).bind(sessionId).run();
 }
 
 // Activity Logs

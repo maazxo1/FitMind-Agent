@@ -1,7 +1,7 @@
 import { routeAgentRequest } from 'agents';
 import { FitnessCoachAgent } from './agents/FitnessCoachAgent';
 import { WorkoutPlannerAgent } from './agents/WorkoutPlannerAgent';
-import { createUser, getUserById, getUserByEmail, createSession, getUserSessions, getPendingReviews, updateReview } from './lib/db';
+import { createUser, getUserById, getUserByEmail, createSession, getActiveSession, getUserSessions, getPendingReviews, updateReview } from './lib/db';
 import { ingestDocument } from './lib/rag';
 
 export { FitnessCoachAgent, WorkoutPlannerAgent };
@@ -12,6 +12,13 @@ function withSecurityHeaders(res: Response): Response {
 	h.set('X-Frame-Options', 'DENY');
 	h.set('Referrer-Policy', 'strict-origin-when-cross-origin');
 	return new Response(res.body, { status: res.status, statusText: res.statusText, headers: h });
+}
+
+function requireAdminToken(request: Request, env: Env): Response | null {
+	const token = request.headers.get('Authorization')?.replace('Bearer ', '').trim();
+	if (!token || token !== env.ADMIN_SECRET)
+		return Response.json({ error: 'Unauthorized' }, { status: 401 });
+	return null;
 }
 
 async function handleRequest(request: Request, env: Env): Promise<Response> {
@@ -50,12 +57,16 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
 					.bind(name).first<any>();
 			}
 			if (!user) return Response.json({ error: 'user not found' }, { status: 404 });
-			const session = await createSession(env.fitness_coach_db, user.id);
+			// Reuse the most recent active session — never create a new one on every lookup
+			const existingSession = await getActiveSession(env.fitness_coach_db, user.id);
+			const session = existingSession ?? await createSession(env.fitness_coach_db, user.id);
 			return Response.json({ user, session });
 		}
 
-		// POST /users
+		// POST /users — requires admin auth to prevent unauthenticated account creation
 		if (url.pathname === '/users' && method === 'POST') {
+			const authErr = requireAdminToken(request, env);
+			if (authErr) return authErr;
 			let body: any;
 			try { body = await request.json(); } catch { return Response.json({ error: 'Invalid JSON body' }, { status: 400 }); }
 			if (!body.name) return Response.json({ error: 'name is required' }, { status: 400 });
@@ -73,8 +84,10 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
 			return Response.json({ user });
 		}
 
-		// POST /sessions
+		// POST /sessions — requires admin auth to prevent unauthenticated session hijacking
 		if (url.pathname === '/sessions' && method === 'POST') {
+			const authErr = requireAdminToken(request, env);
+			if (authErr) return authErr;
 			let body: any;
 			try { body = await request.json(); } catch { return Response.json({ error: 'Invalid JSON body' }, { status: 400 }); }
 			if (!body.user_id) return Response.json({ error: 'user_id is required' }, { status: 400 });
@@ -93,9 +106,8 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
 
 		// Guard all /admin/* routes with a bearer token
 		if (url.pathname.startsWith('/admin/')) {
-			const token = request.headers.get('Authorization')?.replace('Bearer ', '').trim();
-			if (!token || token !== env.ADMIN_SECRET)
-				return Response.json({ error: 'Unauthorized' }, { status: 401 });
+			const authErr = requireAdminToken(request, env);
+			if (authErr) return authErr;
 		}
 
 		// POST /admin/seed
@@ -114,8 +126,18 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
 				{ title: 'Injury Prevention', category: 'safety', content: 'Most injuries come from too much weight too soon, skipping warm-up, and poor form. Always warm up 5-10 minutes. Learn form before adding weight. Stop immediately on sharp pain. Never train to failure on squat or deadlift alone.' },
 				{ title: 'Rest Days and Overtraining', category: 'recovery', content: 'Muscles grow during rest, not training. Beginners need 48-72 hours between training the same muscle. Signs of overtraining: persistent fatigue, declining performance, poor sleep. Most beginners do best with 3-4 training days per week.' },
 			];
-			// Clear existing knowledge so re-seeding doesn't duplicate
+
+			// Delete old Vectorize vectors before re-seeding to prevent duplicate accumulation
+			const existing = await env.fitness_coach_db.prepare(`SELECT id FROM knowledge_sources`).all<{ id: string }>();
+			if (existing.results.length > 0) {
+				try {
+					await env.VECTORIZE.deleteByIds(existing.results.map(r => r.id));
+				} catch (err) {
+					console.warn('[FitMind] Failed to delete old Vectorize entries before re-seed:', err);
+				}
+			}
 			await env.fitness_coach_db.prepare(`DELETE FROM knowledge_sources`).run();
+
 			let count = 0;
 			for (const doc of docs) {
 				await ingestDocument(env, doc);

@@ -5,6 +5,7 @@ declare interface Env {
 	CF_ACCOUNT_ID: string;
 	AI_GATEWAY_NAME: string;
 	ADMIN_SECRET: string;
+	INTERNAL_KEY: string;
 	fitness_coach_db: D1Database;
 	VECTORIZE: VectorizeIndex;
 	AI: Ai;

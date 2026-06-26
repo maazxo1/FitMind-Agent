@@ -83,7 +83,8 @@ export class WorkoutPlannerAgent extends Agent<Env, {}> {
 		}
 
 		if (request.method === 'POST') {
-			if (request.headers.get('X-Internal-Key') !== this.env.ADMIN_SECRET) {
+			const expectedKey = this.env.INTERNAL_KEY || this.env.ADMIN_SECRET;
+			if (request.headers.get('X-Internal-Key') !== expectedKey) {
 				return Response.json({ error: 'Unauthorized' }, { status: 401 });
 			}
 			try {
@@ -104,7 +105,8 @@ export class WorkoutPlannerAgent extends Agent<Env, {}> {
 			headers: { 'Content-Type': 'application/json', 'x-goog-api-key': this.env.GEMINI_API_KEY },
 			body: JSON.stringify(body),
 		};
-		const RETRYABLE = new Set([429, 500, 503]);
+		// 429 is NOT retried — fall through immediately so caller can switch to Workers AI
+		const RETRYABLE = new Set([500, 503]);
 		for (let attempt = 0; attempt < 2; attempt++) {
 			const res = await fetch(url, opts);
 			if (!RETRYABLE.has(res.status)) return res;
@@ -164,11 +166,15 @@ export class WorkoutPlannerAgent extends Agent<Env, {}> {
 
 	private async generatePlanWithWorkersAI(req: WorkoutRequest): Promise<string> {
 		const prompt = `${SYSTEM_PROMPT(req)}\n\nGenerate a detailed workout plan for: ${req.query}`;
-		const res = await (this.env.AI.run('@cf/meta/llama-3.3-70b-instruct-fp8-fast', {
-			messages: [{ role: 'user', content: prompt }],
-			max_tokens: 4096,
-		}) as Promise<{ response: string }>);
-		return res.response?.trim() || 'Could not generate a plan right now. Please try again.';
+		try {
+			const res = await (this.env.AI.run('@cf/meta/llama-3.3-70b-instruct-fp8-fast', {
+				messages: [{ role: 'user', content: prompt }],
+				max_tokens: 4096,
+			}) as Promise<{ response: string }>);
+			return res.response?.trim() || 'Could not generate a plan right now. Please try again.';
+		} catch {
+			throw new Error('Both AI models are temporarily unavailable. Please try again in a moment.');
+		}
 	}
 
 	private async executeTool(name: string, args: any): Promise<string> {
